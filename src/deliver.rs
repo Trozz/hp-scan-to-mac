@@ -1,6 +1,7 @@
 //! Turns scanned pages into files and sends them to every target a profile uses.
 
 use crate::config::{OutputFormat, Profile, Settings};
+use crate::ocr;
 use crate::paperless::Paperless;
 use crate::pdf;
 use crate::s3::S3;
@@ -63,6 +64,24 @@ fn build_files(profile: &Profile, pages: Vec<pdf::Page>, format: OutputFormat) -
     }
 }
 
+/// Runs OCR on a PDF when the profile asks for it. Returns whether the bytes were replaced.
+async fn apply_ocr(profile: &Profile, file: &mut OutFile, program: &str) -> bool {
+    if !profile.ocr || file.mime != "application/pdf" {
+        return false;
+    }
+    match ocr::run(program, &file.bytes, &profile.ocr_language, ocr::TIMEOUT).await {
+        Ok(bytes) => {
+            info!("OCR done for {}", file.name);
+            file.bytes = bytes;
+            true
+        }
+        Err(e) => {
+            warn!("OCR failed for {}, delivering without it: {e:#}", file.name);
+            false
+        }
+    }
+}
+
 /// Writes via a hidden temp file and rename so folder watchers never see partial files.
 async fn write_unique(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (stem, ext) = file_name.rsplit_once('.').unwrap_or((file_name, ""));
@@ -122,6 +141,9 @@ impl Delivery {
         if settings.notify && !cfg!(target_os = "macos") {
             warn!("Notifications are only available on macOS");
         }
+        if settings.profiles.iter().any(|p| p.ocr) {
+            ocr::check(ocr::PROGRAM)?;
+        }
         Ok(Self {
             paperless: settings
                 .paperless
@@ -164,7 +186,8 @@ impl Delivery {
         let mut deliveries = Vec::new();
         let mut all_ok = true;
 
-        for file in build_files(profile, pages, format) {
+        for mut file in build_files(profile, pages, format) {
+            let ocr = apply_ocr(profile, &mut file, ocr::PROGRAM).await;
             let path = write_unique(&profile.output, &file.name, &file.bytes).await?;
             let name = path
                 .file_name()
@@ -224,6 +247,7 @@ impl Delivery {
                 "size": file.bytes.len(),
                 "sha256": hex::encode(Sha256::digest(&file.bytes)),
                 "content_type": file.mime,
+                "ocr": ocr,
             }));
         }
 
@@ -271,6 +295,84 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ColorMode, PaperSize};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_profile() -> Profile {
+        Profile {
+            name: "Test".into(),
+            output: std::env::temp_dir(),
+            resolution: 300,
+            color: ColorMode::Color,
+            paper_size: PaperSize::A4,
+            format: None,
+            filename: "Scan".into(),
+            local: true,
+            paperless: false,
+            s3: false,
+            webhook: false,
+            emulated_duplex: false,
+            ocr: true,
+            ocr_language: "eng".into(),
+        }
+    }
+
+    fn fake_ocr(name: &str, body: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("hpscan-deliver-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ocrmypdf");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    fn out_file(mime: &'static str) -> OutFile {
+        OutFile {
+            name: "Scan.pdf".into(),
+            bytes: b"original".to_vec(),
+            mime,
+        }
+    }
+
+    const APPEND_OCR: &str =
+        "for a; do in=$out; out=$a; done\ncp \"$in\" \"$out\"\nprintf OCR >> \"$out\"";
+
+    #[tokio::test]
+    async fn ocr_replaces_pdf_bytes() {
+        let prog = fake_ocr("ok", APPEND_OCR);
+        let mut file = out_file("application/pdf");
+        assert!(apply_ocr(&test_profile(), &mut file, &prog).await);
+        assert_eq!(file.bytes, b"originalOCR");
+    }
+
+    #[tokio::test]
+    async fn ocr_failure_keeps_original() {
+        let prog = fake_ocr("fail", "exit 1");
+        let mut file = out_file("application/pdf");
+        assert!(!apply_ocr(&test_profile(), &mut file, &prog).await);
+        assert_eq!(file.bytes, b"original");
+    }
+
+    #[tokio::test]
+    async fn ocr_skips_jpeg() {
+        let prog = fake_ocr("jpeg", APPEND_OCR);
+        let mut file = out_file("image/jpeg");
+        assert!(!apply_ocr(&test_profile(), &mut file, &prog).await);
+        assert_eq!(file.bytes, b"original");
+    }
+
+    #[tokio::test]
+    async fn ocr_off_leaves_pdf() {
+        let prog = fake_ocr("off", APPEND_OCR);
+        let mut file = out_file("application/pdf");
+        let profile = Profile {
+            ocr: false,
+            ..test_profile()
+        };
+        assert!(!apply_ocr(&profile, &mut file, &prog).await);
+        assert_eq!(file.bytes, b"original");
+    }
 
     #[test]
     fn names_follow_pattern_and_number_jpeg_pages() {

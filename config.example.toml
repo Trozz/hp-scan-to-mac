@@ -24,7 +24,12 @@ emulated_duplex = false
 
 notify = false            # macOS notification for each scan
 # Shell command run for each saved file; the path is in $1 and $HP_SCAN_FILE.
-# post_command = "ocrmypdf \"$1\" \"$1\""
+# post_command = "open \"$1\""
+
+# Searchable PDFs, with page rotation and skew fixed. Needs ocrmypdf
+# (macOS: brew install ocrmypdf, Debian/Ubuntu: apt install ocrmypdf).
+# ocr = false
+# ocr_language = "eng"    # Tesseract codes, e.g. "eng+deu"
 
 # [paperless]
 # url = "http://paperless.local:8000"

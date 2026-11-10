@@ -14,7 +14,8 @@ Tested with an **HP OfficeJet Pro 7720 Wide Format All-in-One**. Other HP printe
 - Finds the printer automatically (Bonjour), and follows it if its IP address changes
 - PDF or JPEG; A4 / Letter / Legal page size for the glass; file name patterns
 - Targets: local folder, Paperless-ngx, S3-compatible storage (AWS, MinIO, R2, ...), signed webhooks
-- Optional macOS notifications and a command to run on each scan (e.g. OCR)
+- Optional OCR with [OCRmyPDF](https://ocrmypdf.readthedocs.io/): searchable PDFs, pages rotated upright and deskewed
+- Optional macOS notifications and a command to run on each scan
 - Autoscan mode: scans as soon as paper is loaded into the feeder
 - Health endpoint, Docker image, LaunchAgent installer
 - Secrets from a file or the macOS Keychain
@@ -61,6 +62,8 @@ Settings come from `~/.config/hp-scan-to-mac/config.toml` (or the file in `HP_SC
 | `emulated_duplex` | `HP_SCAN_EMULATED_DUPLEX` | `false` |
 | `notify` | `HP_SCAN_NOTIFY` | `false` |
 | `post_command` | `HP_SCAN_POST_COMMAND` | none |
+| `ocr` | `HP_SCAN_OCR` | `false` |
+| `ocr_language` | `HP_SCAN_OCR_LANGUAGE` | `eng` |
 | `[paperless] url, token, tags` | `PAPERLESS_URL`, `PAPERLESS_TOKEN`, `PAPERLESS_TAGS` | off |
 | `[s3] endpoint, bucket, region, prefix, access_key_id, secret_access_key, path_style` | `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_PREFIX`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_PATH_STYLE` | off |
 | `[webhook] url, secret, token` | `WEBHOOK_URL`, `WEBHOOK_SECRET`, `WEBHOOK_TOKEN` | off |
@@ -78,7 +81,7 @@ security add-generic-password -s hp-scan-to-mac -a paperless -w
 
 ### Profiles
 
-Each `[[profile]]` is one entry on the printer's list. It inherits the top-level settings and can change `output`, `resolution`, `color`, `paper_size`, `format`, `filename`, `local`, `paperless`, `s3`, `webhook` and `emulated_duplex`. Uploads that are configured are on for every profile unless the profile turns them off.
+Each `[[profile]]` is one entry on the printer's list. It inherits the top-level settings and can change `output`, `resolution`, `color`, `paper_size`, `format`, `filename`, `local`, `paperless`, `s3`, `webhook`, `emulated_duplex`, `ocr` and `ocr_language`. Uploads that are configured are on for every profile unless the profile turns them off.
 
 ```toml
 [[profile]]
@@ -97,7 +100,18 @@ When any profile is defined, only the profiles are registered. The printer allow
 - Files are always written to the output folder first. With `local = false` the local copy is deleted only after every upload for that file succeeded; if any upload fails, the file is kept and the log says so. Uploads are retried 3 times.
 - **Paperless-ngx:** posted to `/api/documents/post_document/` with the file name as title and the configured tags.
 - **S3:** uploaded to `<prefix>/<file name>`. Set `path_style = true` for MinIO and similar.
-- **Webhook:** a JSON `POST` after each scan (`scan.completed`, or `scan.failed` if scanning failed) with the files (name, size, SHA-256, local path if kept) and each upload's result (Paperless task id, S3 key). Headers: `Idempotency-Key` (the event id), `X-Signature-256: sha256=<hex HMAC of the body>` when a secret is set, and `Authorization: Bearer` when a token is set.
+- **Webhook:** a JSON `POST` after each scan (`scan.completed`, or `scan.failed` if scanning failed) with the files (name, size, SHA-256, local path if kept, whether OCR was applied) and each upload's result (Paperless task id, S3 key). Headers: `Idempotency-Key` (the event id), `X-Signature-256: sha256=<hex HMAC of the body>` when a secret is set, and `Authorization: Bearer` when a token is set.
+
+### OCR
+
+With `ocr = true`, each PDF is run through `ocrmypdf --rotate-pages --deskew` before it is saved or uploaded, so every target gets a searchable PDF with pages turned upright and straightened. Install OCRmyPDF first:
+
+```sh
+brew install ocrmypdf            # macOS
+sudo apt install ocrmypdf        # Debian / Ubuntu
+```
+
+The service won't start if OCR is on and `ocrmypdf` is missing. For other languages install the Tesseract language pack (e.g. `brew install tesseract-lang`, `apt install tesseract-ocr-deu`) and set `ocr_language = "eng+deu"`. If OCR fails or takes longer than 5 minutes, the original PDF is delivered and the log says why. JPEG output is never OCR'd. Paperless skips its own OCR for PDFs that already have text.
 
 ### Emulated duplex (2-sided)
 
@@ -141,7 +155,6 @@ The [Docker workflow](.github/workflows/docker.yml) publishes `linux/amd64` and 
 ## Notes and limits
 
 - **2-sided on the 7720:** its duplex unit is for printing; the feeder scans one side. Use emulated duplex. Printers with a duplex feeder do true 2-sided scans when 2-sided is chosen on the panel.
-- **No OCR built in.** Paperless does OCR, or use `post_command` with e.g. `ocrmypdf`.
 - **Page size** applies to the glass. The feeder measures each sheet, so feeder scans always match the paper.
 - **Local Network permission:** recent macOS versions ask before apps reach devices on your network. If the log shows "No route to host" or similar, allow `hp-scan-to-mac` in System Settings > Privacy & Security > Local Network.
 - **Folder access:** macOS protects `~/Documents`, `~/Desktop` and `~/Downloads`. If the log shows "Operation not permitted" when saving, allow access when prompted, or use a folder outside those (e.g. `~/Scans`).
