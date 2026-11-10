@@ -5,6 +5,7 @@ mod device;
 mod discovery;
 mod health;
 mod jpeg;
+mod ocr;
 mod paperless;
 mod pdf;
 mod s3;
