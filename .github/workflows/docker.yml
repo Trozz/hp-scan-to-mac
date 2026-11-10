@@ -13,6 +13,11 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant:
+          - { suffix: "", ocr: "false" }
+          - { suffix: "-ocr", ocr: "true" }
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -26,6 +31,8 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=${{ matrix.variant.suffix }},onlatest=true
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -39,5 +46,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: OCR=${{ matrix.variant.ocr }}
+          cache-from: type=gha,scope=image${{ matrix.variant.suffix }}
+          cache-to: type=gha,mode=max,scope=image${{ matrix.variant.suffix }}

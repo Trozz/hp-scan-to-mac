@@ -22,9 +22,14 @@ local = true              # keep a copy in `output`; false = upload only
 # Adds a "<name> 2-sided" entry: scan the fronts, flip the stack, choose it again for the backs.
 emulated_duplex = false
 
-notify = false            # macOS notification for each scan
+notify = false            # desktop notification (macOS, or Linux with notify-send)
 # Shell command run for each saved file; the path is in $1 and $HP_SCAN_FILE.
-# post_command = "ocrmypdf \"$1\" \"$1\""
+# post_command = "open \"$1\""
+
+# Searchable PDFs, with page rotation and skew fixed. Needs ocrmypdf
+# (macOS: brew install ocrmypdf, Debian/Ubuntu: apt install ocrmypdf).
+# ocr = false
+# ocr_language = "eng"    # Tesseract codes, e.g. "eng+deu"
 
 # [paperless]
 # url = "http://paperless.local:8000"

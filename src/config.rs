@@ -103,9 +103,17 @@ pub struct CliSettings {
     #[arg(long, env = "HP_SCAN_EMULATED_DUPLEX", global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     emulated_duplex: Option<bool>,
 
-    /// Show a macOS notification for each scan
+    /// Show a desktop notification for each scan (macOS, or Linux with notify-send)
     #[arg(long, env = "HP_SCAN_NOTIFY", global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     notify: Option<bool>,
+
+    /// Make PDFs searchable and fix rotation/skew with ocrmypdf
+    #[arg(long, env = "HP_SCAN_OCR", global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    ocr: Option<bool>,
+
+    /// Tesseract language codes, e.g. eng or eng+deu [default: eng]
+    #[arg(long, env = "HP_SCAN_OCR_LANGUAGE", global = true)]
+    ocr_language: Option<String>,
 
     /// Shell command run for each saved file; the path is in $1 and $HP_SCAN_FILE
     #[arg(long, env = "HP_SCAN_POST_COMMAND", global = true)]
@@ -189,6 +197,8 @@ struct FileSettings {
     filename: Option<String>,
     local: Option<bool>,
     emulated_duplex: Option<bool>,
+    ocr: Option<bool>,
+    ocr_language: Option<String>,
     notify: Option<bool>,
     post_command: Option<String>,
     paperless: Option<FilePaperless>,
@@ -255,6 +265,8 @@ struct FileProfile {
     s3: Option<bool>,
     webhook: Option<bool>,
     emulated_duplex: Option<bool>,
+    ocr: Option<bool>,
+    ocr_language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +290,8 @@ pub struct Profile {
     pub s3: bool,
     pub webhook: bool,
     pub emulated_duplex: bool,
+    pub ocr: bool,
+    pub ocr_language: String,
 }
 
 #[derive(Debug, Clone)]
@@ -487,6 +501,12 @@ impl Settings {
             s3: s3.is_some(),
             webhook: webhook.is_some(),
             emulated_duplex: false,
+            ocr: cli.ocr.or(file.ocr).unwrap_or(false),
+            ocr_language: cli
+                .ocr_language
+                .clone()
+                .or(file.ocr_language)
+                .unwrap_or_else(|| "eng".into()),
         };
 
         let mut profiles: Vec<Profile> = file
@@ -508,6 +528,8 @@ impl Settings {
                 s3: p.s3.unwrap_or(base.s3),
                 webhook: p.webhook.unwrap_or(base.webhook),
                 emulated_duplex: p.emulated_duplex.unwrap_or(false),
+                ocr: p.ocr.unwrap_or(base.ocr),
+                ocr_language: p.ocr_language.unwrap_or_else(|| base.ocr_language.clone()),
             })
             .collect();
         if profiles.is_empty() {
@@ -530,6 +552,12 @@ impl Settings {
             if p.paperless && paperless.is_none() {
                 bail!(
                     "profile \"{}\" uses Paperless, which is not configured",
+                    p.name
+                );
+            }
+            if p.ocr && p.format == Some(OutputFormat::Jpeg) {
+                bail!(
+                    "profile \"{}\" has OCR on but format = \"jpeg\"; OCR only works on PDFs",
                     p.name
                 );
             }
@@ -642,6 +670,31 @@ mod tests {
     fn rejects_unknown_keys_and_bad_patterns() {
         assert!(parse("colour = \"gray\"", CliSettings::default()).is_err());
         assert!(parse("filename = \"%Q\"", CliSettings::default()).is_err());
+    }
+
+    #[test]
+    fn ocr_defaults_off_and_profiles_inherit() {
+        let s = parse(
+            "ocr = true\nocr_language = \"deu\"\n[[profile]]\nname = \"A\"\n[[profile]]\nname = \"B\"\nocr = false\n[[profile]]\nname = \"C\"\nocr_language = \"eng+fra\"",
+            CliSettings::default(),
+        )
+        .unwrap();
+        assert!(s.profiles[0].ocr && s.profiles[0].ocr_language == "deu");
+        assert!(!s.profiles[1].ocr);
+        assert!(s.profiles[2].ocr && s.profiles[2].ocr_language == "eng+fra");
+        let d = parse("", CliSettings::default()).unwrap();
+        assert!(!d.profiles[0].ocr && d.profiles[0].ocr_language == "eng");
+    }
+
+    #[test]
+    fn rejects_ocr_with_jpeg_format() {
+        let err = parse(
+            "[[profile]]\nname = \"P\"\nformat = \"jpeg\"\nocr = true",
+            CliSettings::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("OCR") && err.contains("\"P\""), "{err}");
     }
 
     #[test]

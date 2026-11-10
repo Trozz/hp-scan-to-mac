@@ -5,8 +5,10 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM debian:trixie-slim
+ARG OCR=false
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
+        $([ "$OCR" = true ] && echo ocrmypdf tesseract-ocr-eng) \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 1000 --create-home scanner \
     && mkdir -p /scans /config \

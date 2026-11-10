@@ -1,6 +1,7 @@
 //! Turns scanned pages into files and sends them to every target a profile uses.
 
 use crate::config::{OutputFormat, Profile, Settings};
+use crate::ocr;
 use crate::paperless::Paperless;
 use crate::pdf;
 use crate::s3::S3;
@@ -9,8 +10,9 @@ use anyhow::Result;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -20,6 +22,7 @@ pub struct Delivery {
     webhook: Option<Webhook>,
     notify: bool,
     post_command: Option<String>,
+    ocr: OcrRunner,
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -63,6 +66,63 @@ fn build_files(profile: &Profile, pages: Vec<pdf::Page>, format: OutputFormat) -
     }
 }
 
+/// Runs OCR one document at a time, and gives up on it once shutdown starts.
+struct OcrRunner {
+    program: String,
+    gate: Semaphore,
+    stop: watch::Sender<bool>,
+}
+
+impl OcrRunner {
+    fn new(program: &str) -> Self {
+        Self {
+            program: program.into(),
+            gate: Semaphore::new(1),
+            stop: watch::Sender::new(false),
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Runs OCR on a PDF when the profile asks for it. Returns whether the bytes were replaced.
+    async fn apply(&self, profile: &Profile, file: &mut OutFile) -> bool {
+        if !profile.ocr || file.mime != "application/pdf" {
+            return false;
+        }
+        let mut stopped = self.stop.subscribe();
+        let run = async {
+            let _turn = self.gate.acquire().await;
+            ocr::run(
+                &self.program,
+                &file.bytes,
+                &profile.ocr_language,
+                ocr::TIMEOUT,
+            )
+            .await
+        };
+        let result = tokio::select! {
+            r = run => r,
+            _ = stopped.wait_for(|s| *s) => {
+                warn!("Shutting down, delivering {} without OCR", file.name);
+                return false;
+            }
+        };
+        match result {
+            Ok(bytes) => {
+                info!("OCR done for {}", file.name);
+                file.bytes = bytes;
+                true
+            }
+            Err(e) => {
+                warn!("OCR failed for {}, delivering without it: {e:#}", file.name);
+                false
+            }
+        }
+    }
+}
+
 /// Writes via a hidden temp file and rename so folder watchers never see partial files.
 async fn write_unique(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (stem, ext) = file_name.rsplit_once('.').unwrap_or((file_name, ""));
@@ -78,19 +138,44 @@ async fn write_unique(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathB
     Ok(path)
 }
 
-fn notify(title: &str, message: &str) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
+fn osascript_args(title: &str, message: &str) -> Vec<String> {
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
         quote(message),
         quote(title)
     );
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .spawn();
+    vec!["-e".into(), script]
+}
+
+fn notify_send_args(title: &str, message: &str) -> Vec<String> {
+    vec![
+        "--app-name=hp-scan-to-mac".into(),
+        "--".into(),
+        title.into(),
+        message.into(),
+    ]
+}
+
+fn notify_command(title: &str, message: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        return ("osascript", osascript_args(title, message));
+    }
+    ("notify-send", notify_send_args(title, message))
+}
+
+fn has_notify_send() -> bool {
+    std::process::Command::new("notify-send")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn notify(title: &str, message: &str) {
+    let (program, args) = notify_command(title, message);
+    let _ = std::process::Command::new(program).args(args).spawn();
 }
 
 fn run_post_command(tasks: &Mutex<JoinSet<()>>, command: &str, path: &Path) {
@@ -119,8 +204,17 @@ fn run_post_command(tasks: &Mutex<JoinSet<()>>, command: &str, path: &Path) {
 
 impl Delivery {
     pub fn new(settings: &Settings) -> Result<Self> {
-        if settings.notify && !cfg!(target_os = "macos") {
-            warn!("Notifications are only available on macOS");
+        Self::with_ocr_program(settings, ocr::PROGRAM)
+    }
+
+    fn with_ocr_program(settings: &Settings, ocr_program: &str) -> Result<Self> {
+        if settings.notify && !cfg!(target_os = "macos") && !has_notify_send() {
+            warn!(
+                "notify-send not found; install libnotify (e.g. apt install libnotify-bin) for notifications"
+            );
+        }
+        if settings.profiles.iter().any(|p| p.ocr) {
+            ocr::check(ocr_program)?;
         }
         Ok(Self {
             paperless: settings
@@ -132,18 +226,40 @@ impl Delivery {
             webhook: settings.webhook.as_ref().map(Webhook::new).transpose()?,
             notify: settings.notify,
             post_command: settings.post_command.clone(),
+            ocr: OcrRunner::new(ocr_program),
             tasks: Mutex::new(JoinSet::new()),
         })
     }
 
     /// Waits for post commands still running, so a short-lived run does not cut them off.
+    /// Delivers in the background so the printer can be served meanwhile.
+    pub fn spawn(self: &Arc<Self>, profile: Profile, pages: Vec<pdf::Page>, format: OutputFormat) {
+        let this = self.clone();
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            if let Err(e) = this.deliver(&profile, pages, format).await {
+                error!("Delivery failed: {e:#}");
+                this.failed(&profile, &e).await;
+            }
+        });
+    }
+
+    /// Stops OCR in progress so pending scans are saved quickly on shutdown.
+    pub fn stop(&self) {
+        self.ocr.stop();
+    }
+
+    /// Waits for deliveries and post commands, including ones they start.
     pub async fn finish(&self) {
-        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
-        if tasks.is_empty() {
-            return;
+        loop {
+            let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+            if tasks.is_empty() {
+                return;
+            }
+            info!("Waiting for deliveries and post commands to finish");
+            while tasks.join_next().await.is_some() {}
         }
-        info!("Waiting for post commands to finish");
-        while tasks.join_next().await.is_some() {}
     }
 
     pub fn notify(&self, title: &str, message: &str) {
@@ -164,7 +280,8 @@ impl Delivery {
         let mut deliveries = Vec::new();
         let mut all_ok = true;
 
-        for file in build_files(profile, pages, format) {
+        for mut file in build_files(profile, pages, format) {
+            let ocr = self.ocr.apply(profile, &mut file).await;
             let path = write_unique(&profile.output, &file.name, &file.bytes).await?;
             let name = path
                 .file_name()
@@ -224,6 +341,7 @@ impl Delivery {
                 "size": file.bytes.len(),
                 "sha256": hex::encode(Sha256::digest(&file.bytes)),
                 "content_type": file.mime,
+                "ocr": ocr,
             }));
         }
 
@@ -271,6 +389,223 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ColorMode, PaperSize};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_profile() -> Profile {
+        Profile {
+            name: "Test".into(),
+            output: std::env::temp_dir(),
+            resolution: 300,
+            color: ColorMode::Color,
+            paper_size: PaperSize::A4,
+            format: None,
+            filename: "Scan".into(),
+            local: true,
+            paperless: false,
+            s3: false,
+            webhook: false,
+            emulated_duplex: false,
+            ocr: true,
+            ocr_language: "eng".into(),
+        }
+    }
+
+    fn fake_ocr(name: &str, body: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("hpscan-deliver-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ocrmypdf");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    fn out_file(mime: &'static str) -> OutFile {
+        OutFile {
+            name: "Scan.pdf".into(),
+            bytes: b"original".to_vec(),
+            mime,
+        }
+    }
+
+    const APPEND_OCR: &str =
+        "for a; do in=$out; out=$a; done\ncp \"$in\" \"$out\"\nprintf OCR >> \"$out\"";
+
+    #[tokio::test]
+    async fn ocr_replaces_pdf_bytes() {
+        let prog = fake_ocr("ok", APPEND_OCR);
+        let mut file = out_file("application/pdf");
+        assert!(
+            OcrRunner::new(&prog)
+                .apply(&test_profile(), &mut file)
+                .await
+        );
+        assert_eq!(file.bytes, b"originalOCR");
+    }
+
+    #[tokio::test]
+    async fn ocr_failure_keeps_original() {
+        let prog = fake_ocr("fail", "exit 1");
+        let mut file = out_file("application/pdf");
+        assert!(
+            !OcrRunner::new(&prog)
+                .apply(&test_profile(), &mut file)
+                .await
+        );
+        assert_eq!(file.bytes, b"original");
+    }
+
+    #[tokio::test]
+    async fn ocr_skips_jpeg() {
+        let prog = fake_ocr("jpeg", APPEND_OCR);
+        let mut file = out_file("image/jpeg");
+        assert!(
+            !OcrRunner::new(&prog)
+                .apply(&test_profile(), &mut file)
+                .await
+        );
+        assert_eq!(file.bytes, b"original");
+    }
+
+    #[tokio::test]
+    async fn ocr_off_leaves_pdf() {
+        let prog = fake_ocr("off", APPEND_OCR);
+        let mut file = out_file("application/pdf");
+        let profile = Profile {
+            ocr: false,
+            ..test_profile()
+        };
+        assert!(!OcrRunner::new(&prog).apply(&profile, &mut file).await);
+        assert_eq!(file.bytes, b"original");
+    }
+
+    const SLOW: &str = "[ \"$1\" = --version ] && exit 0\nsleep 30";
+
+    #[tokio::test]
+    async fn ocr_stop_delivers_original() {
+        let runner = std::sync::Arc::new(OcrRunner::new(&fake_ocr("stop", SLOW)));
+        let task = {
+            let runner = runner.clone();
+            tokio::spawn(async move {
+                let mut file = out_file("application/pdf");
+                let applied = runner.apply(&test_profile(), &mut file).await;
+                (applied, file.bytes)
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        runner.stop();
+        let (applied, bytes) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("OCR did not stop")
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(bytes, b"original");
+
+        let mut file = out_file("application/pdf");
+        let started = std::time::Instant::now();
+        assert!(!runner.apply(&test_profile(), &mut file).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn ocr_runs_one_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("hpscan-deliver-{}-gate", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (lock, log) = (dir.join("lock"), dir.join("overlap"));
+        let prog = fake_ocr(
+            "gate",
+            &format!(
+                "mkdir '{}' || echo overlap >> '{}'\nsleep 0.3\nrmdir '{}'\n{APPEND_OCR}",
+                lock.display(),
+                log.display(),
+                lock.display()
+            ),
+        );
+        let runner = OcrRunner::new(&prog);
+        let (mut a, mut b) = (out_file("application/pdf"), out_file("application/pdf"));
+        let profile = test_profile();
+        let (ra, rb) = tokio::join!(
+            runner.apply(&profile, &mut a),
+            runner.apply(&profile, &mut b)
+        );
+        assert!(ra && rb);
+        assert!(!log.exists(), "two OCR runs overlapped");
+    }
+
+    #[tokio::test]
+    async fn spawned_delivery_is_saved_without_ocr_on_shutdown() {
+        let output =
+            std::env::temp_dir().join(format!("hpscan-deliver-{}-spawn-out", std::process::id()));
+        let _ = std::fs::remove_dir_all(&output);
+        std::fs::create_dir_all(&output).unwrap();
+        let profile = Profile {
+            output: output.clone(),
+            ..test_profile()
+        };
+        let settings = Settings {
+            printer: crate::config::PrinterSource::Fixed("printer".into()),
+            profiles: vec![profile.clone()],
+            notify: false,
+            post_command: None,
+            paperless: None,
+            s3: None,
+            webhook: None,
+            health_listen: None,
+            autoscan_delay: 5,
+        };
+        let page = || pdf::Page {
+            jpeg: vec![0xFF, 0xD8, 0xFF, 0xD9],
+            info: crate::jpeg::JpegInfo {
+                width: 2550,
+                height: 3300,
+                components: 3,
+            },
+            dpi: 300,
+        };
+        let delivery = std::sync::Arc::new(
+            Delivery::with_ocr_program(&settings, &fake_ocr("spawn", SLOW)).unwrap(),
+        );
+        let started = std::time::Instant::now();
+        delivery.spawn(profile, vec![page()], OutputFormat::Pdf);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        delivery.stop();
+        tokio::time::timeout(Duration::from_secs(3), delivery.finish())
+            .await
+            .expect("finish did not return");
+        let files: Vec<_> = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(std::fs::read(&files[0]).unwrap(), pdf::build(&[page()]));
+    }
+
+    #[test]
+    fn notify_send_args_end_options() {
+        assert_eq!(
+            notify_send_args("Scan failed", "-x \"bad\""),
+            [
+                "--app-name=hp-scan-to-mac",
+                "--",
+                "Scan failed",
+                "-x \"bad\""
+            ]
+        );
+    }
+
+    #[test]
+    fn osascript_args_escape_quotes() {
+        assert_eq!(
+            osascript_args("T", "a \"b\" \\c"),
+            [
+                "-e",
+                "display notification \"a \\\"b\\\" \\\\c\" with title \"T\""
+            ]
+        );
+    }
 
     #[test]
     fn names_follow_pattern_and_number_jpeg_pages() {

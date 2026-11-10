@@ -522,6 +522,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "libc",
  "mdns-sd",
  "reqwest",
  "roxmltree",
