@@ -28,7 +28,7 @@ pub struct App {
     device: RwLock<Arc<Device>>,
     caps: ScannerCaps,
     user_timeout: Duration,
-    delivery: Delivery,
+    delivery: Arc<Delivery>,
     pending: Mutex<Option<PendingFronts>>,
     pub status: Arc<Status>,
 }
@@ -89,7 +89,7 @@ impl App {
         let status = Arc::new(Status::default());
         status.set_printer(device.host());
         Ok(Self {
-            delivery: Delivery::new(&settings)?,
+            delivery: Arc::new(Delivery::new(&settings)?),
             settings,
             device: RwLock::new(Arc::new(device)),
             caps,
@@ -138,6 +138,7 @@ impl App {
             _ = sigterm.recv() => {},
         }
         info!("Shutting down");
+        self.delivery.stop();
         self.flush_pending(true).await;
         self.delivery.finish().await;
         Ok(())
@@ -288,7 +289,8 @@ impl App {
 
         if !profile.emulated_duplex {
             self.status.scanned(&profile.name);
-            return self.delivery.deliver(profile, pages, format).await;
+            self.delivery.spawn(profile.clone(), pages, format);
+            return Ok(());
         }
         let fronts = self.pending.lock().unwrap().take();
         let Some(fronts) = fronts else {
@@ -316,7 +318,8 @@ impl App {
         );
         let merged = interleave(fronts.pages, pages, source == InputSource::Feeder);
         self.status.scanned(&profile.name);
-        self.delivery.deliver(profile, merged, fronts.format).await
+        self.delivery.spawn(profile.clone(), merged, fronts.format);
+        Ok(())
     }
 
     /// Saves pending front sides on their own when a different profile is used.
@@ -349,13 +352,8 @@ impl App {
         };
         let profile = &self.settings.profiles[fronts.profile];
         info!("Back sides were not scanned; saving the front sides on their own");
-        if let Err(e) = self
-            .delivery
-            .deliver(profile, fronts.pages, fronts.format)
-            .await
-        {
-            error!("Could not save front sides: {e:#}");
-        }
+        self.delivery
+            .spawn(profile.clone(), fronts.pages, fronts.format);
     }
 
     /// Handles the printer's "scan another page?" prompt after glass scans.
@@ -537,9 +535,12 @@ impl App {
                     )
                     .await?;
                 self.status.scanned(&profile.name);
-                self.delivery
-                    .deliver(profile, pages, profile.format.unwrap_or(OutputFormat::Pdf))
-                    .await
+                self.delivery.spawn(
+                    profile.clone(),
+                    pages,
+                    profile.format.unwrap_or(OutputFormat::Pdf),
+                );
+                anyhow::Ok(())
             }
             .await;
             if let Err(e) = result {

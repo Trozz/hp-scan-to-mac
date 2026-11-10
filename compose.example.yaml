@@ -3,6 +3,8 @@ services:
     image: ghcr.io/OWNER/hp-scan-to-mac:latest
     # For OCR, use the :latest-ocr image and set HP_SCAN_OCR: "true".
     restart: unless-stopped
+    # Reaps OCR helper processes (tesseract, ghostscript) that are stopped on timeout.
+    init: true
     # Host networking is only needed to find the printer automatically (mDNS).
     # With HP_PRINTER set, the default bridge network works.
     network_mode: host

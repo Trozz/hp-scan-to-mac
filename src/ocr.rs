@@ -1,7 +1,8 @@
 //! Runs `ocrmypdf` to add a text layer and fix page rotation and skew.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -30,31 +31,38 @@ pub async fn run(program: &str, pdf: &[u8], language: &str, timeout: Duration) -
     run_in(&std::env::temp_dir(), program, pdf, language, timeout).await
 }
 
-async fn run_in(
-    dir: &Path,
-    program: &str,
-    pdf: &[u8],
-    language: &str,
-    timeout: Duration,
-) -> Result<Vec<u8>> {
-    let id = uuid::Uuid::new_v4();
-    let input = dir.join(format!("hp-scan-{id}.pdf"));
-    let output = dir.join(format!("hp-scan-{id}-ocr.pdf"));
-    let result = ocr_file(&input, &output, program, pdf, language, timeout).await;
-    let _ = tokio::fs::remove_file(&input).await;
-    let _ = tokio::fs::remove_file(&output).await;
-    result
+/// Kills ocrmypdf's whole process group (tesseract, ghostscript) and removes the
+/// private work folder, whether the run finished, failed, timed out or was cancelled.
+struct RunGuard {
+    dir: PathBuf,
+    group: Option<i32>,
 }
 
-async fn ocr_file(
-    input: &Path,
-    output: &Path,
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.group {
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn run_in(
+    parent: &Path,
     program: &str,
     pdf: &[u8],
     language: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    tokio::fs::write(input, pdf)
+    let dir = parent.join(format!("hp-scan-ocr-{}", uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .context("creating OCR work folder")?;
+    let mut guard = RunGuard { dir, group: None };
+    let input = guard.dir.join("in.pdf");
+    let output = guard.dir.join("out.pdf");
+    tokio::fs::write(&input, pdf)
         .await
         .context("writing OCR input")?;
     let child = tokio::process::Command::new(program)
@@ -66,14 +74,17 @@ async fn ocr_file(
             "-l",
             language,
         ])
-        .arg(input)
-        .arg(output)
+        .arg(&input)
+        .arg(&output)
+        .env("TMPDIR", &guard.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("starting {program}"))?;
+    guard.group = child.id().map(|pid| pid as i32);
     let Ok(done) = tokio::time::timeout(timeout, child.wait_with_output()).await else {
         bail!("{program} timed out after {}s", timeout.as_secs_f32());
     };
@@ -87,15 +98,14 @@ async fn ocr_file(
             .unwrap_or("");
         bail!("{program} exited with {}: {last}", done.status);
     }
-    tokio::fs::read(output).await.context("reading OCR output")
+    tokio::fs::read(&output).await.context("reading OCR output")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hpscan-ocr-{}-{name}", std::process::id()));
@@ -115,15 +125,44 @@ mod tests {
         std::fs::read_dir(dir).unwrap().next().is_none()
     }
 
+    /// Waits up to 2s for a process to disappear.
+    fn gone(pid_file: &Path) -> bool {
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// A fake ocrmypdf that starts a long-running child (like tesseract) and waits for it.
+    fn slow_fake(dir: &Path) -> (String, PathBuf) {
+        let pid = dir.join("child.pid");
+        let prog = fake(
+            dir,
+            &format!("sleep 30 &\necho $! > '{}'\nwait", pid.display()),
+        );
+        (prog, pid)
+    }
+
     #[tokio::test]
     async fn run_returns_ocr_output() {
         let dir = test_dir("ok");
         let args = dir.join("args.txt");
+        let tmp = dir.join("tmp.txt");
         let prog = fake(
             &dir,
             &format!(
-                "echo \"$@\" > '{}'\nfor a; do in=$out; out=$a; done\ncp \"$in\" \"$out\"\nprintf OCR >> \"$out\"",
-                args.display()
+                "echo \"$@\" > '{}'\nls -ld \"$TMPDIR\" | cut -c1-10 > '{}'\necho \"$TMPDIR\" >> '{}'\nfor a; do in=$out; out=$a; done\ncp \"$in\" \"$out\"\nprintf OCR >> \"$out\"",
+                args.display(),
+                tmp.display(),
+                tmp.display()
             ),
         );
         let work = dir.join("work");
@@ -151,6 +190,11 @@ mod tests {
             ]
         );
         assert_eq!(args.len(), 8);
+        let tmp = std::fs::read_to_string(tmp).unwrap();
+        let (mode, tmpdir) = tmp.trim().split_once('\n').unwrap();
+        assert_eq!(mode, "drwx------");
+        assert!(Path::new(tmpdir).starts_with(&work), "{tmpdir}");
+        assert!(args[6].starts_with(tmpdir) && args[7].starts_with(tmpdir));
         assert!(is_empty(&work));
     }
 
@@ -169,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn run_times_out_and_kills() {
         let dir = test_dir("slow");
-        let prog = fake(&dir, "sleep 30");
+        let (prog, pid) = slow_fake(&dir);
         let work = dir.join("work");
         let started = Instant::now();
         let err = run_in(&work, &prog, b"%PDF", "eng", Duration::from_millis(200))
@@ -177,7 +221,42 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(gone(&pid), "child of ocrmypdf still running");
         assert!(is_empty(&work));
+    }
+
+    #[tokio::test]
+    async fn dropped_run_kills_and_cleans_up() {
+        let dir = test_dir("drop");
+        let (prog, pid) = slow_fake(&dir);
+        let work = dir.join("work");
+        let run = run_in(&work, &prog, b"%PDF", "eng", Duration::from_secs(60));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), run)
+                .await
+                .is_err()
+        );
+        assert!(gone(&pid), "child of ocrmypdf still running");
+        assert!(is_empty(&work));
+    }
+
+    /// Runs the real ocrmypdf on a PDF made by `pdf::build` from the JPEG in $HP_SCAN_TEST_JPEG
+    /// and writes the result next to it as `<jpeg>.ocr.pdf`.
+    /// Run with: HP_SCAN_TEST_JPEG=page.jpg cargo test -- --ignored real_ocrmypdf
+    #[tokio::test]
+    #[ignore]
+    async fn real_ocrmypdf_accepts_built_pdf() {
+        let path = std::env::var("HP_SCAN_TEST_JPEG").unwrap();
+        let mut jpeg = std::fs::read(&path).unwrap();
+        let info = crate::jpeg::inspect_and_fix(&mut jpeg).unwrap();
+        let pdf = crate::pdf::build(&[crate::pdf::Page {
+            jpeg,
+            info,
+            dpi: 300,
+        }]);
+        let out = run(PROGRAM, &pdf, "eng", TIMEOUT).await.unwrap();
+        assert!(out.starts_with(b"%PDF"));
+        std::fs::write(format!("{path}.ocr.pdf"), out).unwrap();
     }
 
     #[test]

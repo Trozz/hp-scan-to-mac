@@ -130,7 +130,7 @@ With `HEALTH_LISTEN=127.0.0.1:8090`, `GET /health` returns JSON and status 200 w
 
 ```sh
 docker build -t hp-scan-to-mac .                        # add --build-arg OCR=true for OCR
-docker run -d --name hp-scan --restart unless-stopped \
+docker run -d --init --name hp-scan --restart unless-stopped \
   -e HP_PRINTER=10.30.0.205 -e HP_SCAN_NAME=Scanner \
   -v "$PWD/scans:/scans" hp-scan-to-mac
 ```
