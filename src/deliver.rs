@@ -97,19 +97,44 @@ async fn write_unique(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathB
     Ok(path)
 }
 
-fn notify(title: &str, message: &str) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
+fn osascript_args(title: &str, message: &str) -> Vec<String> {
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
         quote(message),
         quote(title)
     );
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .spawn();
+    vec!["-e".into(), script]
+}
+
+fn notify_send_args(title: &str, message: &str) -> Vec<String> {
+    vec![
+        "--app-name=hp-scan-to-mac".into(),
+        "--".into(),
+        title.into(),
+        message.into(),
+    ]
+}
+
+fn notify_command(title: &str, message: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        return ("osascript", osascript_args(title, message));
+    }
+    ("notify-send", notify_send_args(title, message))
+}
+
+fn has_notify_send() -> bool {
+    std::process::Command::new("notify-send")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn notify(title: &str, message: &str) {
+    let (program, args) = notify_command(title, message);
+    let _ = std::process::Command::new(program).args(args).spawn();
 }
 
 fn run_post_command(tasks: &Mutex<JoinSet<()>>, command: &str, path: &Path) {
@@ -138,8 +163,10 @@ fn run_post_command(tasks: &Mutex<JoinSet<()>>, command: &str, path: &Path) {
 
 impl Delivery {
     pub fn new(settings: &Settings) -> Result<Self> {
-        if settings.notify && !cfg!(target_os = "macos") {
-            warn!("Notifications are only available on macOS");
+        if settings.notify && !cfg!(target_os = "macos") && !has_notify_send() {
+            warn!(
+                "notify-send not found; install libnotify (e.g. apt install libnotify-bin) for notifications"
+            );
         }
         if settings.profiles.iter().any(|p| p.ocr) {
             ocr::check(ocr::PROGRAM)?;
@@ -372,6 +399,30 @@ mod tests {
         };
         assert!(!apply_ocr(&profile, &mut file, &prog).await);
         assert_eq!(file.bytes, b"original");
+    }
+
+    #[test]
+    fn notify_send_args_end_options() {
+        assert_eq!(
+            notify_send_args("Scan failed", "-x \"bad\""),
+            [
+                "--app-name=hp-scan-to-mac",
+                "--",
+                "Scan failed",
+                "-x \"bad\""
+            ]
+        );
+    }
+
+    #[test]
+    fn osascript_args_escape_quotes() {
+        assert_eq!(
+            osascript_args("T", "a \"b\" \\c"),
+            [
+                "-e",
+                "display notification \"a \\\"b\\\" \\\\c\" with title \"T\""
+            ]
+        );
     }
 
     #[test]

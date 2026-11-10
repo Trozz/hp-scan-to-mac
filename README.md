@@ -15,7 +15,7 @@ Tested with an **HP OfficeJet Pro 7720 Wide Format All-in-One**. Other HP printe
 - PDF or JPEG; A4 / Letter / Legal page size for the glass; file name patterns
 - Targets: local folder, Paperless-ngx, S3-compatible storage (AWS, MinIO, R2, ...), signed webhooks
 - Optional OCR with [OCRmyPDF](https://ocrmypdf.readthedocs.io/): searchable PDFs, pages rotated upright and deskewed
-- Optional macOS notifications and a command to run on each scan
+- Optional desktop notifications (macOS, and Linux with `notify-send`) and a command to run on each scan
 - Autoscan mode: scans as soon as paper is loaded into the feeder
 - Health endpoint, Docker image, LaunchAgent installer
 - Secrets from a file or the macOS Keychain
@@ -159,6 +159,7 @@ The [Docker workflow](.github/workflows/docker.yml) publishes `linux/amd64` and 
 - **Local Network permission:** recent macOS versions ask before apps reach devices on your network. If the log shows "No route to host" or similar, allow `hp-scan-to-mac` in System Settings > Privacy & Security > Local Network.
 - **Folder access:** macOS protects `~/Documents`, `~/Desktop` and `~/Downloads`. If the log shows "Operation not permitted" when saving, allow access when prompted, or use a folder outside those (e.g. `~/Scans`).
 - **Discovery on macOS** uses the system's Bonjour service, so it also finds printers on another subnet when your router reflects mDNS. On Linux it sends mDNS queries itself, so the printer must be on the same network (or reflected).
+- **Notifications on Linux** use `notify-send` (package `libnotify-bin` on Debian/Ubuntu) and need a desktop session, so they don't show in Docker or on a headless server.
 - The computer must be awake to receive scans.
 
 ## Credits

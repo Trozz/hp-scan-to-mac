@@ -103,7 +103,7 @@ pub struct CliSettings {
     #[arg(long, env = "HP_SCAN_EMULATED_DUPLEX", global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     emulated_duplex: Option<bool>,
 
-    /// Show a macOS notification for each scan
+    /// Show a desktop notification for each scan (macOS, or Linux with notify-send)
     #[arg(long, env = "HP_SCAN_NOTIFY", global = true, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     notify: Option<bool>,
 
