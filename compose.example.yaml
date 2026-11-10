@@ -1,6 +1,7 @@
 services:
   hp-scan:
     image: ghcr.io/OWNER/hp-scan-to-mac:latest
+    # For OCR, use the :latest-ocr image and set HP_SCAN_OCR: "true".
     restart: unless-stopped
     # Host networking is only needed to find the printer automatically (mDNS).
     # With HP_PRINTER set, the default bridge network works.
@@ -9,6 +10,7 @@ services:
       HP_PRINTER: 10.30.0.205
       HP_SCAN_NAME: Scanner
       # HP_SCAN_CONFIG: /config/config.toml
+      # HP_SCAN_OCR: "true"
       # PAPERLESS_URL: http://paperless:8000
       # PAPERLESS_TOKEN: file:/run/secrets/paperless_token
     volumes:

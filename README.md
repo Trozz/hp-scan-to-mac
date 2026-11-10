@@ -129,7 +129,7 @@ With `HEALTH_LISTEN=127.0.0.1:8090`, `GET /health` returns JSON and status 200 w
 ## Docker
 
 ```sh
-docker build -t hp-scan-to-mac .
+docker build -t hp-scan-to-mac .                        # add --build-arg OCR=true for OCR
 docker run -d --name hp-scan --restart unless-stopped \
   -e HP_PRINTER=10.30.0.205 -e HP_SCAN_NAME=Scanner \
   -v "$PWD/scans:/scans" hp-scan-to-mac
@@ -139,7 +139,7 @@ See [compose.example.yaml](compose.example.yaml). The image saves to `/scans`, r
 
 The container only makes outgoing connections, so the default bridge network works when `HP_PRINTER` is set. Automatic printer discovery needs `network_mode: host` (Linux hosts). Set `HP_SCAN_NAME`, otherwise the container ID is shown on the printer.
 
-The [Docker workflow](.github/workflows/docker.yml) publishes `linux/amd64` and `linux/arm64` images to GitHub Container Registry on pushes to `main` and on `v*` tags.
+The [Docker workflow](.github/workflows/docker.yml) publishes `linux/amd64` and `linux/arm64` images to GitHub Container Registry on pushes to `main` and on `v*` tags, in two variants: `latest` (about 120 MB) and `latest-ocr` with OCRmyPDF and English Tesseract data (about 365 MB). Version tags get the same `-ocr` suffix.
 
 ## Commands
 
