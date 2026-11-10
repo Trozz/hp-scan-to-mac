@@ -21,7 +21,7 @@ Tested with an **HP OfficeJet Pro 7720 Wide Format All-in-One**. Other HP printe
 - Secrets from a file or the macOS Keychain
 - Removes itself from the printer's list when stopped
 
-## Quick start (macOS)
+## Quick start
 
 ```sh
 cargo build --release
@@ -39,9 +39,10 @@ On the printer choose **Scan > Computer**, pick your Mac and press **Start**. Sc
 ./scripts/install.sh
 ```
 
-This installs the binary to `~/.local/bin`, creates `~/.config/hp-scan-to-mac/config.toml` from [config.example.toml](config.example.toml) if it doesn't exist, and adds a LaunchAgent that starts at login and restarts if it stops. Logs: `~/Library/Logs/hp-scan-to-mac.log`.
+This installs the binary to `~/.local/bin`, creates `~/.config/hp-scan-to-mac/config.toml` from [config.example.toml](config.example.toml) if it doesn't exist, and sets up a service that starts at login and restarts if it stops. To remove it: `./scripts/uninstall.sh` (your config is kept). Use `COMMAND=autoscan ./scripts/install.sh` for autoscan mode instead.
 
-After editing the config: `launchctl kickstart -k gui/$(id -u)/io.github.hp-scan-to-mac`. To remove the service: `./scripts/uninstall.sh` (your config is kept). Use `COMMAND=autoscan ./scripts/install.sh` for autoscan mode instead.
+- **macOS:** a LaunchAgent. Logs: `~/Library/Logs/hp-scan-to-mac.log`. After editing the config: `launchctl kickstart -k gui/$(id -u)/io.github.hp-scan-to-mac`.
+- **Linux:** a systemd user service. Logs: `journalctl --user -u hp-scan-to-mac -f`. After editing the config: `systemctl --user restart hp-scan-to-mac`. To keep it running when you're not logged in (headless machines): `loginctl enable-linger $USER`. Environment variables given to `install.sh` are stored in `~/.config/hp-scan-to-mac/service.env`.
 
 ## Configuration
 
