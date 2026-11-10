@@ -11,6 +11,7 @@ const WALKUP_DESTINATIONS: &str = "/WalkupScanToComp/WalkupScanToCompDestination
 const EVENT_TABLE: &str = "/EventMgmt/EventTable";
 
 pub struct Device {
+    host: String,
     base: String,
     http: Client,
 }
@@ -80,6 +81,9 @@ pub struct JobSettings {
     pub resolution: u32,
     pub color_mode: &'static str,
     pub duplex: bool,
+    /// Scan area in 1/300 inch.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Strips scheme and host so absolute `Location` headers and plain paths are treated alike.
@@ -183,20 +187,36 @@ pub fn parse_user_action_timeout(xml: &str) -> Result<Option<u64>> {
         .map(|v| v as u64))
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SourceCaps {
+    pub max_dpi: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScannerCaps {
     pub adf_duplex: bool,
-    pub platen_max_dpi: u32,
-    pub adf_max_dpi: u32,
+    pub platen: SourceCaps,
+    pub adf: SourceCaps,
 }
 
-fn max_dpi(node: Option<roxmltree::Node>) -> u32 {
-    node.into_iter()
-        .flat_map(|n| n.descendants())
-        .filter(|n| n.tag_name().name() == "XResolution")
-        .filter_map(|n| n.text()?.trim().parse().ok())
-        .max()
-        .unwrap_or(0)
+fn source_caps(node: Option<roxmltree::Node>) -> SourceCaps {
+    let Some(node) = node else {
+        return SourceCaps::default();
+    };
+    let max_of = |name: &str| {
+        node.descendants()
+            .filter(|n| n.tag_name().name() == name)
+            .filter_map(|n| n.text()?.trim().parse().ok())
+            .max()
+            .unwrap_or(0)
+    };
+    SourceCaps {
+        max_dpi: max_of("XResolution"),
+        max_width: max_of("MaxWidth"),
+        max_height: max_of("MaxHeight"),
+    }
 }
 
 pub fn parse_scanner_caps(xml: &str) -> Result<ScannerCaps> {
@@ -204,8 +224,8 @@ pub fn parse_scanner_caps(xml: &str) -> Result<ScannerCaps> {
     let find = |name: &str| doc.descendants().find(|n| n.tag_name().name() == name);
     Ok(ScannerCaps {
         adf_duplex: find("AdfDuplexInputCaps").is_some(),
-        platen_max_dpi: max_dpi(find("Platen")),
-        adf_max_dpi: max_dpi(find("AdfSimplexInputCaps")),
+        platen: source_caps(find("PlatenInputCaps")),
+        adf: source_caps(find("AdfSimplexInputCaps")),
     })
 }
 
@@ -239,7 +259,7 @@ pub fn escl_job_xml(s: &JobSettings) -> String {
 	<ScanRegions xmlns="http://www.pwg.org/schemas/2010/12/sm" xmlns:n0="http://www.pwg.org/schemas/2010/12/sm" n0:MustHonor="false">
 		<ScanRegion>
 			<Height>{height}</Height>
-			<Width>2550</Width>
+			<Width>{width}</Width>
 			<XOffset>0</XOffset>
 			<YOffset>0</YOffset>
 			<ContentRegionUnits>escl:ThreeHundredthsOfInches</ContentRegionUnits>
@@ -263,11 +283,8 @@ pub fn escl_job_xml(s: &JobSettings) -> String {
 	<Shadow>70</Shadow>
 	<Overscan>true</Overscan>{threshold}
 </ScanSettings>"#,
-        height = if s.source == InputSource::Feeder {
-            4200
-        } else {
-            3300
-        },
+        height = s.height,
+        width = s.width,
         res = s.resolution,
         mode = s.color_mode,
         duplex = s.duplex,
@@ -281,9 +298,14 @@ impl Device {
             .timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self {
+            host: host.to_string(),
             base: format!("http://{host}"),
             http,
         })
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     async fn get_text(&self, path: &str) -> Result<(StatusCode, String)> {
@@ -551,6 +573,26 @@ mod tests {
         let s = parse_destination_settings(one).unwrap();
         assert_eq!(s.shortcut.as_deref(), Some("SaveJPEG"));
         assert!(!s.duplex);
+    }
+
+    #[test]
+    fn parses_caps_per_source() {
+        let xml = r#"<scan:ScannerCapabilities xmlns:scan="s">
+<scan:Platen><scan:PlatenInputCaps><scan:MaxWidth>2550</scan:MaxWidth><scan:MaxHeight>4217</scan:MaxHeight>
+<scan:XResolution>600</scan:XResolution><scan:XResolution>1200</scan:XResolution></scan:PlatenInputCaps></scan:Platen>
+<scan:Adf><scan:AdfSimplexInputCaps><scan:MaxWidth>2550</scan:MaxWidth><scan:MaxHeight>4200</scan:MaxHeight>
+<scan:XResolution>300</scan:XResolution></scan:AdfSimplexInputCaps></scan:Adf></scan:ScannerCapabilities>"#;
+        let caps = parse_scanner_caps(xml).unwrap();
+        assert!(!caps.adf_duplex);
+        assert_eq!(
+            (
+                caps.platen.max_dpi,
+                caps.platen.max_width,
+                caps.platen.max_height
+            ),
+            (1200, 2550, 4217)
+        );
+        assert_eq!((caps.adf.max_dpi, caps.adf.max_height), (300, 4200));
     }
 
     #[test]

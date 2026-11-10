@@ -1,0 +1,70 @@
+# hp-scan-to-mac configuration
+# Copy to ~/.config/hp-scan-to-mac/config.toml (or point HP_SCAN_CONFIG at it).
+# Every setting is optional. Flags and environment variables override this file.
+# Secrets accept a plain value, "file:/path/to/secret" or "keychain:<service>[/<account>]".
+
+# Printer IP or hostname. Leave out to find it automatically on the network.
+# printer = "10.30.0.205"
+# When finding it automatically, only use a printer whose name contains this (or exact UUID).
+# printer_match = "OfficeJet"
+
+# Name shown on the printer's "Scan to Computer" list (default: this computer's name).
+# name = "Moros"
+
+output = "~/Documents/Scans"
+resolution = 300          # DPI, capped to what the scanner supports
+color = "color"           # color | gray | bw
+paper_size = "a4"         # a4 | letter | legal | max (applies to the glass)
+# format = "pdf"          # pdf | jpeg; default follows the shortcut picked on the printer
+filename = "Scan %Y-%m-%d %H.%M.%S"   # strftime pattern
+local = true              # keep a copy in `output`; false = upload only
+
+# Adds a "<name> 2-sided" entry: scan the fronts, flip the stack, choose it again for the backs.
+emulated_duplex = false
+
+notify = false            # macOS notification for each scan
+# Shell command run for each saved file; the path is in $1 and $HP_SCAN_FILE.
+# post_command = "ocrmypdf \"$1\" \"$1\""
+
+# [paperless]
+# url = "http://paperless.local:8000"
+# token = "keychain:hp-scan-to-mac/paperless"
+# tags = [3, 7]
+
+# [s3]
+# endpoint = "https://s3.eu-west-2.amazonaws.com"
+# region = "eu-west-2"
+# bucket = "my-scans"
+# prefix = "inbox"
+# access_key_id = "AKIA..."
+# secret_access_key = "file:~/.config/hp-scan-to-mac/s3-secret"
+# path_style = false      # true for MinIO and some S3-compatible services
+
+# [webhook]
+# url = "https://n8n.example/webhook/scan"
+# secret = "file:~/.config/hp-scan-to-mac/webhook-secret"   # HMAC-SHA256, header X-Signature-256
+# token = "..."                                              # sent as Authorization: Bearer
+
+# [health]
+# listen = "127.0.0.1:8090"
+
+# [autoscan]
+# delay = 5               # seconds after paper is loaded before scanning
+
+# Profiles add extra entries to the printer's list. Each inherits the settings above.
+# When any profile is defined, only the profiles are registered.
+#
+# [[profile]]
+# name = "Moros"
+#
+# [[profile]]
+# name = "Moros Paperless"
+# local = false
+# paperless = true
+#
+# [[profile]]
+# name = "Moros Photo"
+# color = "color"
+# resolution = 600
+# format = "jpeg"
+# paperless = false

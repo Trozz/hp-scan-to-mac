@@ -1,104 +1,152 @@
 # hp-scan-to-mac
 
-A small Rust service that makes the **Scan to Computer** button on HP printers work with a Mac, without HP Smart or HP Easy Scan.
+A small Rust service that makes the **Scan to Computer** button on HP printers work without HP Smart or HP Easy Scan. Built for macOS, and it also runs on Linux and in Docker.
 
-The service adds your Mac to the printer's "Scan to Computer" list. When you pick it on the printer's panel, the scan is pulled over the network and saved as a PDF (or JPEG) in a folder on your Mac. It can also send each scan to [Paperless-ngx](https://docs.paperless-ngx.com/).
+It adds your computer to the printer's "Scan to Computer" list. When you pick it on the printer's panel, the scan is pulled over the network and saved as a PDF (or JPEG). It can also upload each scan to [Paperless-ngx](https://docs.paperless-ngx.com/) or S3-compatible storage, and post a webhook.
 
 Tested with an **HP OfficeJet Pro 7720 Wide Format All-in-One**. Other HP printers that offer `WalkupScanToComp` and eSCL over HTTP should work too.
 
 ## Features
 
-- Shows up as a destination on the printer's panel (named after your Mac)
+- Appears on the printer's panel, with optional extra entries (profiles) such as "Moros Paperless" or "Moros Gray"
 - Document feeder (multi-page) and glass, including "scan another page?" on the glass
-- PDF by default; the panel's JPEG shortcuts save `.jpg` files
-- Fixes the zero-height JPEG headers HP sends for feeder scans
-- Re-registers automatically if the printer reboots or the Mac wakes from sleep
+- 2-sided scanning with a one-sided feeder (emulated duplex)
+- Finds the printer automatically (Bonjour), and follows it if its IP address changes
+- PDF or JPEG; A4 / Letter / Legal page size for the glass; file name patterns
+- Targets: local folder, Paperless-ngx, S3-compatible storage (AWS, MinIO, R2, ...), signed webhooks
+- Optional macOS notifications and a command to run on each scan (e.g. OCR)
+- Autoscan mode: scans as soon as paper is loaded into the feeder
+- Health endpoint, Docker image, LaunchAgent installer
+- Secrets from a file or the macOS Keychain
 - Removes itself from the printer's list when stopped
-- Optional upload to Paperless-ngx
-- No runtime dependencies: one static binary
 
-## Requirements
-
-- macOS
-- Rust toolchain (`rustup`) to build
-- The printer's IP address (printer panel: Wireless or Network summary). Give the printer a fixed IP or DHCP reservation.
-
-## Quick start
-
-Try it in the foreground first:
+## Quick start (macOS)
 
 ```sh
 cargo build --release
-./target/release/hp-scan-to-mac --printer 10.30.0.205 run
+./target/release/hp-scan-to-mac discover     # find the printer
+./target/release/hp-scan-to-mac run          # register and wait for scans
 ```
 
 On the printer choose **Scan > Computer**, pick your Mac and press **Start**. Scans land in `~/Documents/Scans`.
 
-To check scanning without touching the printer panel:
-
-```sh
-./target/release/hp-scan-to-mac --printer 10.30.0.205 test-scan
-```
+`test-scan` scans once without touching the printer panel (feeder if loaded, otherwise the glass).
 
 ### Run as a background service
 
 ```sh
-HP_PRINTER=10.30.0.205 ./scripts/install.sh
-```
-
-This installs the binary to `~/.local/bin` and a LaunchAgent (`~/Library/LaunchAgents/io.github.hp-scan-to-mac.plist`) that starts at login and restarts if it stops. Logs go to `~/Library/Logs/hp-scan-to-mac.log`.
-
-Any setting below can be passed to `install.sh` as an environment variable. Run it again to change settings. To remove it:
-
-```sh
-./scripts/uninstall.sh
-```
-
-## Settings
-
-Every option can be a flag or an environment variable.
-
-| Flag | Environment | Default | Notes |
-| --- | --- | --- | --- |
-| `--printer` | `HP_PRINTER` | required | Printer IP or hostname |
-| `--name` | `HP_SCAN_NAME` | Mac's Computer Name | Name shown on the printer |
-| `--output` | `HP_SCAN_OUTPUT` | `~/Documents/Scans` | Folder for scans |
-| `--resolution` | `HP_SCAN_RESOLUTION` | `300` | DPI, capped to what the scan source supports (the 7720 feeder tops out at 300) |
-| `--color` | `HP_SCAN_COLOR` | `color` | `color`, `gray` or `bw` |
-| `--paperless-url` | `PAPERLESS_URL` | | e.g. `http://paperless.local:8000` |
-| `--paperless-token` | `PAPERLESS_TOKEN` | | Paperless profile page > API token |
-| `--paperless-tags` | `PAPERLESS_TAGS` | | Comma-separated tag IDs, e.g. `3,7` |
-| `--paperless-delete-local` | `PAPERLESS_DELETE_LOCAL` | off | Delete the local file once Paperless accepts it |
-| | `RUST_LOG` | `info` | `debug` for more detail |
-
-Commands: `run` (default), `test-scan`, `list` (show destinations registered on the printer), `unregister`.
-
-### Paperless-ngx
-
-```sh
-HP_PRINTER=10.30.0.205 \
-PAPERLESS_URL=http://paperless.local:8000 \
-PAPERLESS_TOKEN=xxxxxxxx \
 ./scripts/install.sh
 ```
 
-Each scan is saved locally first, then posted to `/api/documents/post_document/`. Failed uploads are retried 3 times; the local file is always kept if the upload fails. The token ends up in the LaunchAgent plist, which the install script creates readable only by you.
+This installs the binary to `~/.local/bin`, creates `~/.config/hp-scan-to-mac/config.toml` from [config.example.toml](config.example.toml) if it doesn't exist, and adds a LaunchAgent that starts at login and restarts if it stops. Logs: `~/Library/Logs/hp-scan-to-mac.log`.
+
+After editing the config: `launchctl kickstart -k gui/$(id -u)/io.github.hp-scan-to-mac`. To remove the service: `./scripts/uninstall.sh` (your config is kept). Use `COMMAND=autoscan ./scripts/install.sh` for autoscan mode instead.
+
+## Configuration
+
+Settings come from `~/.config/hp-scan-to-mac/config.toml` (or the file in `HP_SCAN_CONFIG` / `--config`). Flags and environment variables override the file. [config.example.toml](config.example.toml) documents every option.
+
+| Config file | Environment / flag | Default |
+| --- | --- | --- |
+| `printer` | `HP_PRINTER` / `--printer` | found automatically |
+| `printer_match` | `HP_PRINTER_MATCH` | first printer found |
+| `name` | `HP_SCAN_NAME` | computer name |
+| `output` | `HP_SCAN_OUTPUT` | `~/Documents/Scans` |
+| `resolution` | `HP_SCAN_RESOLUTION` | `300` (capped to the scanner's maximum) |
+| `color` | `HP_SCAN_COLOR` | `color` (`gray`, `bw`) |
+| `paper_size` | `HP_SCAN_PAPER_SIZE` | `a4` (`letter`, `legal`, `max`) |
+| `format` | `HP_SCAN_FORMAT` | follows the printer's shortcut (`pdf`, `jpeg`) |
+| `filename` | `HP_SCAN_FILENAME` | `Scan %Y-%m-%d %H.%M.%S` ([strftime](https://docs.rs/chrono/latest/chrono/format/strftime/index.html)) |
+| `local` | `HP_SCAN_LOCAL` | `true` |
+| `emulated_duplex` | `HP_SCAN_EMULATED_DUPLEX` | `false` |
+| `notify` | `HP_SCAN_NOTIFY` | `false` |
+| `post_command` | `HP_SCAN_POST_COMMAND` | none |
+| `[paperless] url, token, tags` | `PAPERLESS_URL`, `PAPERLESS_TOKEN`, `PAPERLESS_TAGS` | off |
+| `[s3] endpoint, bucket, region, prefix, access_key_id, secret_access_key, path_style` | `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_PREFIX`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_PATH_STYLE` | off |
+| `[webhook] url, secret, token` | `WEBHOOK_URL`, `WEBHOOK_SECRET`, `WEBHOOK_TOKEN` | off |
+| `[health] listen` | `HEALTH_LISTEN` | off |
+| `[autoscan] delay` | `AUTOSCAN_DELAY` | `5` seconds |
+
+Every environment variable also has a matching `--flag` (see `--help`). Profiles can only be set in the config file.
+
+**Secrets** (Paperless token, S3 secret, webhook secret and token) can be a plain value, `file:/path/to/file` or `keychain:<service>[/<account>]`. To store one in the Keychain:
+
+```sh
+security add-generic-password -s hp-scan-to-mac -a paperless -w
+# then: token = "keychain:hp-scan-to-mac/paperless"
+```
+
+### Profiles
+
+Each `[[profile]]` is one entry on the printer's list. It inherits the top-level settings and can change `output`, `resolution`, `color`, `paper_size`, `format`, `filename`, `local`, `paperless`, `s3`, `webhook` and `emulated_duplex`. Uploads that are configured are on for every profile unless the profile turns them off.
+
+```toml
+[[profile]]
+name = "Moros"
+
+[[profile]]
+name = "Moros Paperless"
+local = false
+paperless = true
+```
+
+When any profile is defined, only the profiles are registered. The printer allows up to 15 entries in total, across all computers.
+
+### Uploads
+
+- Files are always written to the output folder first. With `local = false` the local copy is deleted only after every upload for that file succeeded; if any upload fails, the file is kept and the log says so. Uploads are retried 3 times.
+- **Paperless-ngx:** posted to `/api/documents/post_document/` with the file name as title and the configured tags.
+- **S3:** uploaded to `<prefix>/<file name>`. Set `path_style = true` for MinIO and similar.
+- **Webhook:** a JSON `POST` after each scan (`scan.completed`, or `scan.failed` if scanning failed) with the files (name, size, SHA-256, local path if kept) and each upload's result (Paperless task id, S3 key). Headers: `Idempotency-Key` (the event id), `X-Signature-256: sha256=<hex HMAC of the body>` when a secret is set, and `Authorization: Bearer` when a token is set.
+
+### Emulated duplex (2-sided)
+
+With `emulated_duplex = true`, an extra "<name> 2-sided" entry appears on the printer. Choose it to scan the front sides, flip the whole stack, and choose it again to scan the back sides. The pages are merged into one document in the right order. If the backs aren't scanned within 10 minutes, or you scan with a different entry, the fronts are saved on their own.
+
+### Autoscan
+
+`hp-scan-to-mac autoscan` scans with the first profile whenever paper is loaded into the feeder, without using the printer panel. It waits `delay` seconds after paper is detected, and only re-arms once the feeder has been emptied. Run it instead of `run`, not alongside it.
+
+### Health
+
+With `HEALTH_LISTEN=127.0.0.1:8090`, `GET /health` returns JSON and status 200 when the printer was reached in the last 5 minutes, otherwise 503. `hp-scan-to-mac healthcheck` checks it and exits non-zero when unhealthy.
+
+## Docker
+
+```sh
+docker build -t hp-scan-to-mac .
+docker run -d --name hp-scan --restart unless-stopped \
+  -e HP_PRINTER=10.30.0.205 -e HP_SCAN_NAME=Scanner \
+  -v "$PWD/scans:/scans" hp-scan-to-mac
+```
+
+See [compose.example.yaml](compose.example.yaml). The image saves to `/scans`, runs as UID 1000, serves the health endpoint on port 8090 and has a Docker `HEALTHCHECK`. Mount a config file and set `HP_SCAN_CONFIG=/config/config.toml` for profiles.
+
+The container only makes outgoing connections, so the default bridge network works when `HP_PRINTER` is set. Automatic printer discovery needs `network_mode: host` (Linux hosts). Set `HP_SCAN_NAME`, otherwise the container ID is shown on the printer.
+
+The [Docker workflow](.github/workflows/docker.yml) publishes `linux/amd64` and `linux/arm64` images to GitHub Container Registry on pushes to `main` and on `v*` tags.
+
+## Commands
+
+`run` (default), `autoscan`, `test-scan`, `discover`, `list` (entries registered on the printer), `unregister`, `healthcheck`.
 
 ## How it works
 
-1. `POST /WalkupScanToComp/WalkupScanToCompDestinations` registers the Mac (reused if the name already exists).
+1. `POST /WalkupScanToComp/WalkupScanToCompDestinations` registers each profile (reused if the name already exists).
 2. `GET /EventMgmt/EventTable?timeout=1200` with `If-None-Match` long-polls for printer events.
-3. On a `ScanEvent` for our destination, it reads the walk-up event (`ScanRequested`, `ScanNewPageRequested`, `ScanPagesComplete`) and the destination's chosen shortcut.
+3. On a `ScanEvent` for one of our entries, it reads the walk-up event (`ScanRequested`, `ScanNewPageRequested`, `ScanPagesComplete`) and the entry's chosen shortcut.
 4. The scan runs over eSCL: `POST /eSCL/ScanJobs`, then `GET .../NextDocument` until the job has no more pages. The feeder is used if it has paper, otherwise the glass.
-5. Pages are JPEGs; for PDF output they are embedded unchanged (no re-compression).
+5. Pages are JPEGs (feeder pages get their height fixed from the DNL marker). For PDF output they are embedded unchanged.
 
 ## Notes and limits
 
-- **2-sided scanning:** the OfficeJet Pro 7720's duplex unit is for printing. Its document feeder scans one side only, so the service logs a warning and scans single-sided if 2-sided is requested. Printers with a duplex feeder get true 2-sided scans.
-- **No OCR:** "Save as Editable Text" produces a normal PDF. Paperless does OCR if you use it.
+- **2-sided on the 7720:** its duplex unit is for printing; the feeder scans one side. Use emulated duplex. Printers with a duplex feeder do true 2-sided scans when 2-sided is chosen on the panel.
+- **No OCR built in.** Paperless does OCR, or use `post_command` with e.g. `ocrmypdf`.
+- **Page size** applies to the glass. The feeder measures each sheet, so feeder scans always match the paper.
 - **Local Network permission:** recent macOS versions ask before apps reach devices on your network. If the log shows "No route to host" or similar, allow `hp-scan-to-mac` in System Settings > Privacy & Security > Local Network.
-- **Folder access:** macOS protects `~/Documents`, `~/Desktop` and `~/Downloads`. If the log shows "Operation not permitted" when saving, allow access when prompted, or set `HP_SCAN_OUTPUT` to a folder outside those (e.g. `~/Scans`).
-- The Mac must be awake to receive scans.
+- **Folder access:** macOS protects `~/Documents`, `~/Desktop` and `~/Downloads`. If the log shows "Operation not permitted" when saving, allow access when prompted, or use a folder outside those (e.g. `~/Scans`).
+- **Discovery on macOS** uses the system's Bonjour service, so it also finds printers on another subnet when your router reflects mDNS. On Linux it sends mDNS queries itself, so the printer must be on the same network (or reflected).
+- The computer must be awake to receive scans.
 
 ## Credits
 
