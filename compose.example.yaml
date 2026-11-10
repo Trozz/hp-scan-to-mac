@@ -1,0 +1,16 @@
+services:
+  hp-scan:
+    image: ghcr.io/OWNER/hp-scan-to-mac:latest
+    restart: unless-stopped
+    # Host networking is only needed to find the printer automatically (mDNS).
+    # With HP_PRINTER set, the default bridge network works.
+    network_mode: host
+    environment:
+      HP_PRINTER: 10.30.0.205
+      HP_SCAN_NAME: Scanner
+      # HP_SCAN_CONFIG: /config/config.toml
+      # PAPERLESS_URL: http://paperless:8000
+      # PAPERLESS_TOKEN: file:/run/secrets/paperless_token
+    volumes:
+      - ./scans:/scans
+      # - ./config.toml:/config/config.toml:ro

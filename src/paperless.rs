@@ -1,5 +1,6 @@
 //! Uploads finished scans to Paperless-ngx via POST /api/documents/post_document/.
 
+use crate::config::PaperlessSettings;
 use anyhow::{Result, bail};
 use reqwest::{Client, multipart};
 use std::path::Path;
@@ -13,14 +14,14 @@ pub struct Paperless {
 }
 
 impl Paperless {
-    pub fn new(url: &str, token: &str, tags: Vec<u32>) -> Result<Self> {
+    pub fn new(settings: &PaperlessSettings) -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
-            url: url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
-            tags,
+            url: settings.url.clone(),
+            token: settings.token.clone(),
+            tags: settings.tags.clone(),
             http,
         })
     }
